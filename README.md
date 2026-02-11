@@ -118,9 +118,7 @@ python tool.py
     ]
   }
 ]
-
----
-
+```
 ## Acknowledgements
 
 This project uses [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory),
