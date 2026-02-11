@@ -118,4 +118,10 @@ python tool.py
     ]
   }
 ]
-```
+
+---
+
+## Acknowledgements
+
+This project uses [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory),
+an open-source framework licensed under the Apache License 2.0.
