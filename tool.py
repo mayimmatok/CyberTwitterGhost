@@ -37,13 +37,58 @@ MENTION_RE = re.compile(r"@([A-Za-z0-9_]{1,15})")
 URL_RE = re.compile(r"https?://\S+|pic\.x\.com/\S+|pic\.twitter\.com/\S+", re.IGNORECASE)
 WHITESPACE_RE = re.compile(r"\s+")
 STATUS_ID_RE = re.compile(r"status/(\d+)")
+HF_SNAPSHOT_PATH_RE = re.compile(r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\][0-9a-f]{8,}", re.IGNORECASE)
 
-DEFAULT_MODEL_BASE = "https://api.openai.com/v1"
-DEFAULT_MODEL_NAME = "gpt-4o-mini"
+DEFAULT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 MAX_HUMAN_CHARS = 120
 MAX_COMPLETION_TRIES = 3
 DOWNLOAD_MAX_ATTEMPTS = 6
 DOWNLOAD_RETRY_ROUNDS = 3
+GEMINI_MIN_INTERVAL = 0.6
+GEMINI_HTTP_RETRIES = 2
+GEMINI_RATE_LIMIT_BACKOFF_MAX = 20
+MIN_GPT_CHARS = 5
+
+
+_GEMINI_LAST_CALL_AT = 0.0
+_GEMINI_NEXT_ALLOWED_AT = 0.0
+_GEMINI_FATAL_ERROR = ""
+_GEMINI_COMPLETION_CACHE = {}
+_GEMINI_FAILED_CACHE = set()
+
+
+def _mark_gemini_fatal(reason: str):
+    global _GEMINI_FATAL_ERROR
+    if not _GEMINI_FATAL_ERROR:
+        print(f"[Gemini禁用] {reason}")
+    _GEMINI_FATAL_ERROR = reason
+
+
+def _extract_retry_after_seconds(http_error: urllib.error.HTTPError):
+    try:
+        val = (http_error.headers or {}).get("Retry-After")
+    except Exception:
+        val = None
+    if not val:
+        return None
+    try:
+        sec = float(str(val).strip())
+        if sec >= 0:
+            return sec
+    except Exception:
+        return None
+    return None
+
+
+def _gemini_wait_gate():
+    global _GEMINI_LAST_CALL_AT
+    min_interval = max(0.0, float(os.getenv("GEMINI_MIN_INTERVAL", GEMINI_MIN_INTERVAL)))
+    now = time.time()
+    gate_ts = max(_GEMINI_NEXT_ALLOWED_AT, _GEMINI_LAST_CALL_AT + min_interval)
+    if gate_ts > now:
+        time.sleep(gate_ts - now)
+    _GEMINI_LAST_CALL_AT = time.time()
 
 
 def ensure_t2s_converter():
@@ -157,6 +202,12 @@ def is_meaningful_text(text: str) -> bool:
     if len(text.strip()) < 2:
         return False
     return re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text) is not None
+
+
+def is_valid_gpt_reply(text: str, min_chars: int = MIN_GPT_CHARS) -> bool:
+    if not text:
+        return False
+    return len(text.strip()) >= int(min_chars)
 
 
 def extract_json_payload(page_html: str):
@@ -534,7 +585,7 @@ def dedupe_records(items, checkpoint: dict, progress: ProgressBars):
 
         human = (conv.get("human") or "").strip()
         gpt = (conv.get("gpt") or "").strip()
-        if not gpt:
+        if not is_valid_gpt_reply(gpt):
             progress.advance(1)
             continue
 
@@ -571,94 +622,146 @@ def _extract_message_content(choice_message):
     return ""
 
 
-def call_chat_completion(messages, model=None, temperature=0.65, max_tokens=120, retries=3):
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("未设置 OPENAI_API_KEY，无法补全空 human。")
+def call_gemini_completion(prompt: str, model: str | None = None, temperature=0.65, max_tokens=120, retries=3):
+    global _GEMINI_NEXT_ALLOWED_AT
 
-    base_url = os.getenv("OPENAI_BASE_URL", DEFAULT_MODEL_BASE).rstrip("/")
-    model_name = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL_NAME)
-    url = f"{base_url}/chat/completions"
+    if _GEMINI_FATAL_ERROR:
+        raise RuntimeError(f"Gemini已停用: {_GEMINI_FATAL_ERROR}")
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("未设置 GEMINI_API_KEY（或 GOOGLE_API_KEY），无法补全空 human。")
+
+    base_url = os.getenv("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE).rstrip("/")
+    model_name = model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    url = f"{base_url}/models/{model_name}:generateContent?key={api_key}"
 
     payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt}]}
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
+    retries = max(1, int(retries))
     for attempt in range(1, retries + 1):
+        _gemini_wait_gate()
         req = urllib.request.Request(
             url,
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, context=SSL_CONTEXT, timeout=DEFAULT_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            choices = data.get("choices") or []
-            if not choices:
-                raise RuntimeError("模型返回 choices 为空")
-            content = _extract_message_content((choices[0] or {}).get("message") or {})
-            if not content:
-                raise RuntimeError("模型文本为空")
-            return content
+            candidates = data.get("candidates") or []
+            if not candidates:
+                raise RuntimeError("Gemini 返回 candidates 为空")
+            parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+            text = "".join((p or {}).get("text", "") for p in parts if isinstance(p, dict)).strip()
+            if not text:
+                raise RuntimeError("Gemini 文本为空")
+            return text
         except urllib.error.HTTPError as e:
             err_body = ""
             try:
                 err_body = e.read().decode("utf-8", errors="replace")
             except Exception:
                 err_body = ""
-            detail = err_body[:300].replace("\n", " ").strip()
+
+            detail = err_body[:280].replace("\n", " ").strip()
             msg = f"HTTP {e.code}"
             if detail:
                 msg += f": {detail}"
+
+            upper = (err_body or "").upper()
+            is_rate_limited = (
+                e.code == 429
+                or "RESOURCE_EXHAUSTED" in upper
+                or "RATE LIMIT" in upper
+            )
+            is_fatal = (
+                e.code in (400, 401, 403, 404)
+                and not is_rate_limited
+            )
+
+            if is_fatal:
+                _mark_gemini_fatal(msg)
+                raise RuntimeError(msg) from e
+
             if attempt == retries:
                 raise RuntimeError(msg) from e
-            time.sleep(1.2 * attempt)
+
+            if is_rate_limited:
+                retry_after = _extract_retry_after_seconds(e)
+                backoff = retry_after if retry_after is not None else (
+                    min(float(os.getenv("GEMINI_RATE_LIMIT_BACKOFF_MAX", GEMINI_RATE_LIMIT_BACKOFF_MAX)), 2.0 * attempt)
+                    + random.uniform(0.0, 1.0)
+                )
+                _GEMINI_NEXT_ALLOWED_AT = max(_GEMINI_NEXT_ALLOWED_AT, time.time() + backoff)
+                print(f"[Gemini限流] 第{attempt}次触发限流，{backoff:.1f}s后重试")
+            else:
+                time.sleep(min(2.0, 0.3 * attempt + 0.2))
         except Exception as e:
             if attempt == retries:
                 raise RuntimeError(str(e)) from e
-            time.sleep(1.2 * attempt)
+            time.sleep(min(2.0, 0.3 * attempt + 0.2))
 
-    raise RuntimeError("调用模型失败")
+    raise RuntimeError("调用 Gemini 失败")
 
 
 def synthesize_human_from_gpt(gpt_text: str) -> str:
+    gpt_text = (gpt_text or "").strip()
+    if not is_meaningful_text(gpt_text):
+        return ""
+
+    if gpt_text in _GEMINI_COMPLETION_CACHE:
+        return _GEMINI_COMPLETION_CACHE[gpt_text]
+    if gpt_text in _GEMINI_FAILED_CACHE:
+        return ""
+    if _GEMINI_FATAL_ERROR:
+        return ""
+
     prompt = (
-        "你是对话数据构造器。给定 assistant 的一句回复，请反推一个自然、合理、简短的 user 上一句。"
-        "只输出 user 这句话本身，不要解释。"
-        "禁止包含@用户名和链接。"
-        "优先简体中文，长度2-120字。"
+        "你是对话数据构造器。给定 assistant 的一句回复，请反推一个自然、合理、和下文完美配合的 user 上一句。\n"
+        "要求：\n"
+        "1) 只输出 user 这句话，不要解释。\n"
+        "2) 不要包含@用户名，不要包含链接。\n"
+        "3) 优先简体中文，长度2-120字。\n"
+        f"assistant回复：{gpt_text}\n"
+        "user上句："
     )
 
     temperatures = (0.6, 0.75, 0.45)
+    retries = max(1, int(os.getenv("GEMINI_HTTP_RETRIES", GEMINI_HTTP_RETRIES)))
     last_error = None
+
     for i in range(min(MAX_COMPLETION_TRIES, len(temperatures))):
         try:
-            messages = [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"assistant回复：{gpt_text}"},
-            ]
-            text = call_chat_completion(
-                messages=messages,
+            text = call_gemini_completion(
+                prompt=prompt,
                 temperature=temperatures[i],
                 max_tokens=120,
-                retries=2,
+                retries=retries,
             )
             text = clean_text(text)
             if len(text) > MAX_HUMAN_CHARS:
                 text = text[:MAX_HUMAN_CHARS].strip()
             if is_meaningful_text(text) and text != gpt_text:
+                _GEMINI_COMPLETION_CACHE[gpt_text] = text
                 return text
         except Exception as e:
             last_error = str(e)
+            if _GEMINI_FATAL_ERROR:
+                break
             continue
+
+    _GEMINI_FAILED_CACHE.add(gpt_text)
     if last_error:
         preview = gpt_text[:40].replace("\n", " ")
         print(f"[补全失败] {last_error} | gpt='{preview}...'")
@@ -839,6 +942,28 @@ def load_json_file(path: Path):
 def merge_dataset_files(json_paths, out_path: Path):
     merged = []
     seen = set()
+
+    # 先加载历史汇总，确保本次执行为追加而非覆盖。
+    existing_rows = load_json_file(out_path)
+    for item in existing_rows:
+        convs = item.get("conversations") or []
+        if len(convs) < 2:
+            continue
+        human = (convs[0].get("value") or "").strip()
+        gpt = (convs[1].get("value") or "").strip()
+        key = (human, gpt)
+        if not is_valid_gpt_reply(gpt) or key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "conversations": [
+                    {"from": "human", "value": human},
+                    {"from": "gpt", "value": gpt},
+                ]
+            }
+        )
+
     for path in json_paths:
         rows = load_json_file(path)
         for item in rows:
@@ -848,7 +973,7 @@ def merge_dataset_files(json_paths, out_path: Path):
             human = (convs[0].get("value") or "").strip()
             gpt = (convs[1].get("value") or "").strip()
             key = (human, gpt)
-            if not gpt or key in seen:
+            if not is_valid_gpt_reply(gpt) or key in seen:
                 continue
             seen.add(key)
             merged.append(
@@ -866,6 +991,30 @@ def merge_dataset_files(json_paths, out_path: Path):
 def merge_empty_human_files(json_paths, out_path: Path):
     merged = []
     seen = set()
+
+    # 先加载历史汇总，确保本次执行为追加而非覆盖。
+    existing_rows = load_json_file(out_path)
+    for item in existing_rows:
+        convs = item.get("conversations") or []
+        if len(convs) < 2:
+            continue
+        human = (convs[0].get("value") or "").strip()
+        gpt = (convs[1].get("value") or "").strip()
+        if human:
+            continue
+        key = ("", gpt)
+        if not is_valid_gpt_reply(gpt) or key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "conversations": [
+                    {"from": "human", "value": ""},
+                    {"from": "gpt", "value": gpt},
+                ]
+            }
+        )
+
     for path in json_paths:
         rows = load_json_file(path)
         for item in rows:
@@ -877,7 +1026,7 @@ def merge_empty_human_files(json_paths, out_path: Path):
             if human:
                 continue
             key = ("", gpt)
-            if not gpt or key in seen:
+            if not is_valid_gpt_reply(gpt) or key in seen:
                 continue
             seen.add(key)
             merged.append(
@@ -892,10 +1041,185 @@ def merge_empty_human_files(json_paths, out_path: Path):
     return out_path, len(merged)
 
 
-def run_cmd(cmd, cwd: Path | None = None, check: bool = True):
+def write_json_atomic(path: Path, data):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def find_missing_empty_human_records(train_rows, empty_rows):
+    train_keys = set()
+    train_gpt_set = set()
+    for item in train_rows:
+        convs = item.get("conversations") if isinstance(item, dict) else None
+        if not isinstance(convs, list) or len(convs) < 2:
+            continue
+        human = ((convs[0] or {}).get("value") or "").strip()
+        gpt = ((convs[1] or {}).get("value") or "").strip()
+        if not is_valid_gpt_reply(gpt):
+            continue
+        train_keys.add((human, gpt))
+        train_gpt_set.add(gpt)
+
+    missing = []
+    seen = set()
+    for item in empty_rows:
+        convs = item.get("conversations") if isinstance(item, dict) else None
+        if not isinstance(convs, list) or len(convs) < 2:
+            continue
+        human = ((convs[0] or {}).get("value") or "").strip()
+        gpt = ((convs[1] or {}).get("value") or "").strip()
+        if human or not is_valid_gpt_reply(gpt):
+            continue
+        key = ("", gpt)
+        if gpt in train_gpt_set or key in train_keys or key in seen:
+            continue
+        seen.add(key)
+        missing.append(
+            {
+                "conversations": [
+                    {"from": "human", "value": ""},
+                    {"from": "gpt", "value": gpt},
+                ]
+            }
+        )
+    return missing
+
+
+def integrate_completed_empty_human(train_json: Path, empty_json: Path):
+    train_rows = load_json_file(train_json)
+    empty_rows = load_json_file(empty_json)
+    missing = find_missing_empty_human_records(train_rows, empty_rows)
+    if not missing:
+        print("空human文件没有新增样本需要补全。")
+        return 0, 0
+
+    print(f"检测到可补全并合并的空human样本: {len(missing)} 条")
+    backup = train_json.with_suffix(train_json.suffix + ".bak")
+    if not backup.exists():
+        write_json_atomic(backup, train_rows)
+
+    merged = []
+    seen = set()
+    for item in train_rows:
+        convs = item.get("conversations") if isinstance(item, dict) else None
+        if not isinstance(convs, list) or len(convs) < 2:
+            continue
+        human = ((convs[0] or {}).get("value") or "").strip()
+        gpt = ((convs[1] or {}).get("value") or "").strip()
+        if not human or not is_valid_gpt_reply(gpt):
+            continue
+        key = (human, gpt)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "conversations": [
+                    {"from": "human", "value": human},
+                    {"from": "gpt", "value": gpt},
+                ]
+            }
+        )
+
+    def _remove_from_empty_json_by_gpt(target_gpt: str):
+        removed = 0
+        kept = []
+        for r in empty_rows:
+            convs = r.get("conversations") if isinstance(r, dict) else None
+            if not isinstance(convs, list) or len(convs) < 2:
+                kept.append(r)
+                continue
+            h = ((convs[0] or {}).get("value") or "").strip()
+            g = ((convs[1] or {}).get("value") or "").strip()
+            if (not h) and g == target_gpt:
+                removed += 1
+                continue
+            kept.append(r)
+        if removed > 0:
+            empty_rows[:] = kept
+            write_json_atomic(empty_json, empty_rows)
+        return removed
+
+    progress = ProgressBars(label="fill-merge", total_steps=2)
+    progress.start_step("Gemini补全并实时写入训练集(第一轮)", len(missing))
+
+    filled = 0
+    added = 0
+    failed = []
+    for item in missing:
+        convs = item.get("conversations") or []
+        if len(convs) < 2:
+            progress.advance(1)
+            continue
+        gpt = ((convs[1] or {}).get("value") or "").strip()
+        if not is_valid_gpt_reply(gpt):
+            progress.advance(1)
+            continue
+
+        generated = synthesize_human_from_gpt(gpt)
+        if generated:
+            filled += 1
+            key = (generated, gpt)
+            if key not in seen:
+                seen.add(key)
+                merged.append(
+                    {
+                        "conversations": [
+                            {"from": "human", "value": generated},
+                            {"from": "gpt", "value": gpt},
+                        ]
+                    }
+                )
+                # 实时转移：每成功一条即写回 all_users_sharegpt.json
+                write_json_atomic(train_json, merged)
+                _remove_from_empty_json_by_gpt(gpt)
+                added += 1
+        else:
+            failed.append(item)
+        progress.advance(1)
+
+    progress.finish_step(f"第一轮补全成功 {filled} 条，失败 {len(failed)} 条")
+
+    progress.start_step("补全失败样本再次补全(第二轮)", max(len(failed), 1))
+    retry_filled = 0
+    retry_added = 0
+    for item in failed:
+        convs = item.get("conversations") or []
+        gpt = ((convs[1] or {}).get("value") or "").strip() if len(convs) >= 2 else ""
+        if not is_valid_gpt_reply(gpt):
+            progress.advance(1)
+            continue
+        generated = synthesize_human_from_gpt(gpt)
+        if generated:
+            retry_filled += 1
+            key = (generated, gpt)
+            if key not in seen:
+                seen.add(key)
+                merged.append(
+                    {
+                        "conversations": [
+                            {"from": "human", "value": generated},
+                            {"from": "gpt", "value": gpt},
+                        ]
+                    }
+                )
+                write_json_atomic(train_json, merged)
+                _remove_from_empty_json_by_gpt(gpt)
+                retry_added += 1
+        progress.advance(1)
+
+    progress.finish_step(f"第二轮补全成功 {retry_filled} 条，实时并入 {retry_added} 条")
+    filled += retry_filled
+    added += retry_added
+    print(f"已更新训练集: {train_json}，原文件备份: {backup}")
+    return filled, added
+
+
+def run_cmd(cmd, cwd: Path | None = None, check: bool = True, env: dict | None = None):
     cmd_str = " ".join(str(x) for x in cmd)
     print(f"[执行] {cmd_str}")
-    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=check)
+    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=check, env=env)
 
 
 def get_venv_bin_paths(venv_dir: Path):
@@ -923,9 +1247,43 @@ def detect_nvidia_gpu() -> bool:
         return False
 
 
-def install_torch_runtime(pip_bin: Path, prefer_gpu: bool):
-    # 先卸载已有 torch，避免 CPU/CUDA 轮子混装。
-    run_cmd([str(pip_bin), "uninstall", "-y", "torch", "torchvision", "torchaudio"], check=False)
+def probe_torch_runtime(python_bin: Path):
+    probe = (
+        "import json\n"
+        "info = {'installed': False}\n"
+        "try:\n"
+        "    import torch\n"
+        "    info = {\n"
+        "        'installed': True,\n"
+        "        'torch': torch.__version__,\n"
+        "        'cuda_available': bool(torch.cuda.is_available()),\n"
+        "        'torch_cuda': torch.version.cuda,\n"
+        "    }\n"
+        "except Exception as e:\n"
+        "    info = {'installed': False, 'error': str(e)}\n"
+        "print(json.dumps(info, ensure_ascii=False))"
+    )
+    result = subprocess.run(
+        [str(python_bin), "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return {"installed": False, "error": (result.stderr or "无法获取 torch 信息").strip()}
+    try:
+        return json.loads(line[-1])
+    except Exception:
+        return {"installed": False, "error": "torch 探测输出不可解析"}
+
+
+def install_torch_runtime(python_bin: Path, prefer_gpu: bool):
+    # 使用 python -m pip，避免 venv 移动后 pip.exe 包装器残留旧路径。
+    run_cmd(
+        [str(python_bin), "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"],
+        check=False,
+    )
 
     if prefer_gpu:
         cuda_indexes = [
@@ -936,7 +1294,17 @@ def install_torch_runtime(pip_bin: Path, prefer_gpu: bool):
         for idx in cuda_indexes:
             try:
                 run_cmd(
-                    [str(pip_bin), "install", "torch", "torchvision", "torchaudio", "--index-url", idx]
+                    [
+                        str(python_bin),
+                        "-m",
+                        "pip",
+                        "install",
+                        "torch",
+                        "torchvision",
+                        "torchaudio",
+                        "--index-url",
+                        idx,
+                    ]
                 )
                 return
             except Exception as exc:
@@ -944,24 +1312,13 @@ def install_torch_runtime(pip_bin: Path, prefer_gpu: bool):
                 continue
         raise RuntimeError(f"CUDA版 PyTorch 安装失败（已尝试 cu128/cu121）: {last_exc}")
 
-    run_cmd([str(pip_bin), "install", "torch", "torchvision", "torchaudio"])
+    run_cmd([str(python_bin), "-m", "pip", "install", "torch", "torchvision", "torchaudio"])
 
 
 def verify_torch_runtime(python_bin: Path, require_gpu: bool):
-    probe = (
-        "import json, torch; "
-        "print(json.dumps({'torch': torch.__version__, "
-        "'cuda_available': bool(torch.cuda.is_available()), "
-        "'torch_cuda': torch.version.cuda}))"
-    )
-    result = subprocess.run(
-        [str(python_bin), "-c", probe],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    info_line = (result.stdout or "").strip().splitlines()[-1]
-    info = json.loads(info_line)
+    info = probe_torch_runtime(python_bin)
+    if not info.get("installed"):
+        raise RuntimeError(f"torch 不可用: {info.get('error', 'unknown_error')}")
     print(
         f"[torch环境] version={info.get('torch')} "
         f"cuda_available={info.get('cuda_available')} torch_cuda={info.get('torch_cuda')}"
@@ -972,6 +1329,18 @@ def verify_torch_runtime(python_bin: Path, require_gpu: bool):
             "已检测到 NVIDIA GPU，但当前虚拟环境未启用 CUDA。"
             "请检查驱动/CUDA 并确认可从 PyTorch CUDA 源安装。"
         )
+    return info
+
+
+def ensure_pip_available(python_bin: Path):
+    probe = subprocess.run(
+        [str(python_bin), "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        run_cmd([str(python_bin), "-m", "ensurepip", "--upgrade"], check=False)
 
 
 def ensure_llamafactory_installed(repo_dir: Path):
@@ -984,19 +1353,34 @@ def ensure_llamafactory_installed(repo_dir: Path):
     if not python_bin.exists():
         run_cmd([sys.executable, "-m", "venv", str(venv_dir)])
 
-    run_cmd([str(pip_bin), "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=repo_dir)
+    ensure_pip_available(python_bin)
+    run_cmd([str(python_bin), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=repo_dir)
 
     # 先安装框架本体，再按硬件安装 torch，避免默认装到 CPU 版。
     try:
-        run_cmd([str(pip_bin), "install", "-e", ".[metrics]"], cwd=repo_dir)
+        run_cmd([str(python_bin), "-m", "pip", "install", "-e", ".[metrics]"], cwd=repo_dir)
     except Exception:
-        run_cmd([str(pip_bin), "install", "-e", "."], cwd=repo_dir)
+        run_cmd([str(python_bin), "-m", "pip", "install", "-e", "."], cwd=repo_dir)
 
     has_gpu = detect_nvidia_gpu()
     print(f"[环境检测] NVIDIA GPU: {'yes' if has_gpu else 'no'}")
-    install_torch_runtime(pip_bin, prefer_gpu=has_gpu)
-    verify_torch_runtime(python_bin, require_gpu=has_gpu)
-    run_cmd([str(pip_bin), "install", "bitsandbytes>=0.39.0"])
+    runtime_ok = False
+    try:
+        info = verify_torch_runtime(python_bin, require_gpu=False)
+        if has_gpu and not info.get("cuda_available"):
+            print("[torch环境] 已有 torch 但 CUDA 不可用，将重装 CUDA 版")
+        else:
+            runtime_ok = True
+            print("[torch环境] 检测通过，跳过重装 torch")
+    except Exception:
+        runtime_ok = False
+
+    if not runtime_ok:
+        install_torch_runtime(python_bin, prefer_gpu=has_gpu)
+        verify_torch_runtime(python_bin, require_gpu=has_gpu)
+
+    if has_gpu:
+        run_cmd([str(python_bin), "-m", "pip", "install", "bitsandbytes>=0.39.0"], check=False)
 
     return python_bin, cli_bin
 
@@ -1010,6 +1394,86 @@ def infer_template_from_model(model_name: str) -> str:
     if "glm" in m:
         return "chatglm"
     return "qwen"
+
+
+def normalize_model_name(model_name: str) -> str:
+    raw = (model_name or "").strip()
+    if not raw:
+        return ""
+
+    local_path = Path(raw).expanduser()
+    if local_path.exists():
+        return str(local_path)
+
+    normalized = raw.replace("\\", "/")
+    m = HF_SNAPSHOT_PATH_RE.search(normalized)
+    if m:
+        repo_id = f"{m.group(1)}/{m.group(2)}"
+        print(f"[模型路径纠正] 检测到快照路径，已改用仓库ID: {repo_id}")
+        return repo_id
+
+    return raw
+
+
+def is_local_model_path(model_name: str) -> bool:
+    if not model_name:
+        return False
+    return Path(model_name).expanduser().exists()
+
+
+def is_hf_model_cached(model_name: str, hub_cache_dir: Path) -> bool:
+    if not model_name:
+        return False
+    if is_local_model_path(model_name):
+        return True
+    repo_dir = hub_cache_dir / f"models--{model_name.replace('/', '--')}"
+    snapshots_dir = repo_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return False
+    try:
+        return any(p.is_dir() for p in snapshots_dir.iterdir())
+    except Exception:
+        return False
+
+
+def ensure_model_downloaded(python_bin: Path, model_name: str, hub_cache_dir: Path):
+    model_name = normalize_model_name(model_name)
+    if is_local_model_path(model_name):
+        print(f"[模型缓存] 检测到本地模型路径: {model_name}")
+        return model_name
+
+    if is_hf_model_cached(model_name, hub_cache_dir):
+        print(f"[模型缓存] 已命中缓存: {model_name}")
+        return model_name
+
+    hub_cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[模型缓存] 首次运行未命中缓存，开始下载: {model_name}")
+
+    downloader = (
+        "import sys; "
+        "from huggingface_hub import snapshot_download; "
+        "snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2], resume_download=True)"
+    )
+    download_env = os.environ.copy()
+    download_env.pop("TRANSFORMERS_OFFLINE", None)
+    download_env.pop("HF_HUB_OFFLINE", None)
+    download_env.pop("HF_DATASETS_OFFLINE", None)
+
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            run_cmd(
+                [str(python_bin), "-c", downloader, model_name, str(hub_cache_dir)],
+                env=download_env,
+            )
+            if is_hf_model_cached(model_name, hub_cache_dir):
+                print(f"[模型缓存] 下载完成并已缓存: {model_name}")
+                return model_name
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"模型下载失败: {model_name} ({last_exc})")
 
 
 def write_llamafactory_dataset_info(dataset_dir: Path, dataset_name: str, dataset_file_name: str):
@@ -1039,29 +1503,134 @@ def write_llamafactory_dataset_info(dataset_dir: Path, dataset_name: str, datase
     info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def suggest_train_hparams(sample_count: int):
+def analyze_sharegpt_quality(dataset_json: Path):
+    stats = {
+        "sample_count": 0,
+        "avg_human_len": 0.0,
+        "avg_gpt_len": 0.0,
+        "short_gpt_ratio": 0.0,
+        "non_cjk_ratio": 0.0,
+        "dup_pair_ratio": 0.0,
+        "quality_tier": "medium",
+    }
+    try:
+        data = json.loads(dataset_json.read_text(encoding="utf-8"))
+    except Exception:
+        return stats
+
+    if not isinstance(data, list) or not data:
+        return stats
+
+    human_lens = []
+    gpt_lens = []
+    short_gpt = 0
+    non_cjk = 0
+    seen = set()
+    dup = 0
+
+    for item in data:
+        convs = item.get("conversations") if isinstance(item, dict) else None
+        if not isinstance(convs, list) or len(convs) < 2:
+            continue
+        human = ((convs[0] or {}).get("value") or "").strip()
+        gpt = ((convs[1] or {}).get("value") or "").strip()
+        if not is_valid_gpt_reply(gpt):
+            continue
+
+        human_lens.append(len(human))
+        gpt_lens.append(len(gpt))
+        if len(gpt) <= 8:
+            short_gpt += 1
+        if re.search(r"[\u4e00-\u9fff]", gpt) is None:
+            non_cjk += 1
+
+        key = (human, gpt)
+        if key in seen:
+            dup += 1
+        else:
+            seen.add(key)
+
+    n = len(gpt_lens)
+    if n == 0:
+        return stats
+
+    stats["sample_count"] = n
+    stats["avg_human_len"] = round(sum(human_lens) / n, 2)
+    stats["avg_gpt_len"] = round(sum(gpt_lens) / n, 2)
+    stats["short_gpt_ratio"] = round(short_gpt / n, 4)
+    stats["non_cjk_ratio"] = round(non_cjk / n, 4)
+    stats["dup_pair_ratio"] = round(dup / n, 4)
+
+    noisy = (
+        stats["short_gpt_ratio"] >= 0.22
+        or stats["dup_pair_ratio"] >= 0.06
+        or stats["avg_gpt_len"] <= 20
+    )
+    clean = (
+        stats["short_gpt_ratio"] <= 0.10
+        and stats["dup_pair_ratio"] <= 0.02
+        and stats["avg_gpt_len"] >= 35
+    )
+    stats["quality_tier"] = "low" if noisy else ("high" if clean else "medium")
+    return stats
+
+
+def suggest_train_hparams(sample_count: int, quality_stats: dict):
+    tier = (quality_stats or {}).get("quality_tier", "medium")
     if sample_count >= 8000:
-        epochs = 2.0
+        base_epochs = 2.0
     elif sample_count >= 3000:
-        epochs = 3.0
+        base_epochs = 2.5
     else:
-        epochs = 4.0
+        base_epochs = 3.0
+
+    # 这类快照提取数据噪声通常偏高：默认保守学习率与较小 LoRA 容量。
+    if tier == "low":
+        epochs = max(1.5, base_epochs - 0.5)
+        lr = "8.0e-5"
+        cutoff_len = 1536
+        lora_rank = 8
+        lora_alpha = 16
+        val_size = 0.08
+    elif tier == "high":
+        epochs = base_epochs
+        lr = "1.5e-4"
+        cutoff_len = 2048
+        lora_rank = 16
+        lora_alpha = 32
+        val_size = 0.03
+    else:
+        epochs = base_epochs
+        lr = "1.0e-4"
+        cutoff_len = 1536
+        lora_rank = 8
+        lora_alpha = 16
+        val_size = 0.05
 
     return {
-        "num_train_epochs": epochs,
-        "learning_rate": "2.0e-4",
+        "num_train_epochs": round(epochs, 2),
+        "learning_rate": lr,
         "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 16,
-        "cutoff_len": 2048,
+        "cutoff_len": cutoff_len,
         "quantization_bit": 4,
-        "lora_rank": 16,
-        "lora_alpha": 32,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "val_size": val_size,
     }
 
 
-def write_train_yaml(config_path: Path, model_name: str, template: str, dataset_name: str, dataset_dir: Path, output_dir: Path, sample_count: int):
-    hp = suggest_train_hparams(sample_count)
-
+def write_train_yaml(
+    config_path: Path,
+    model_name: str,
+    template: str,
+    dataset_name: str,
+    dataset_dir: Path,
+    output_dir: Path,
+    sample_count: int,
+    quality_stats: dict,
+):
+    hp = suggest_train_hparams(sample_count, quality_stats)
     yaml_text = f"""### model
 model_name_or_path: {model_name}
 
@@ -1078,7 +1647,7 @@ dataset_dir: {dataset_dir.as_posix()}
 cutoff_len: {hp['cutoff_len']}
 max_samples: {sample_count}
 overwrite_cache: true
-preprocessing_num_workers: 4
+preprocessing_num_workers: 1
 
 ### output
 output_dir: {output_dir.as_posix()}
@@ -1095,11 +1664,12 @@ learning_rate: {hp['learning_rate']}
 num_train_epochs: {hp['num_train_epochs']}
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-bf16: true
+bf16: false
+fp16: true
 ddp_timeout: 180000000
 
 ### eval
-val_size: 0.03
+val_size: {hp['val_size']}
 per_device_eval_batch_size: 1
 eval_strategy: steps
 eval_steps: 200
@@ -1123,8 +1693,11 @@ def run_training_pipeline(dataset_json: Path, sample_count: int):
     dataset_dir = assets_dir / "datasets"
     config_dir = assets_dir / "configs"
     model_out_dir = OUTPUT_DIR / "models" / "sft_lora"
+    hf_home = (SCRIPT_DIR / "hf_cache").resolve()
+    hf_datasets_cache = (hf_home / "datasets").resolve()
+    hf_hub_cache = (hf_home / "hub").resolve()
 
-    progress = ProgressBars(label="train", total_steps=6)
+    progress = ProgressBars(label="train", total_steps=7)
 
     progress.start_step("准备/安装 LLaMA-Factory 环境", 1)
     python_bin, cli_bin = ensure_llamafactory_installed(repo_dir)
@@ -1141,8 +1714,21 @@ def run_training_pipeline(dataset_json: Path, sample_count: int):
     progress.advance(1)
     progress.finish_step(dataset_file_name)
 
+    progress.start_step("检查/下载基础模型", 1)
+    model_name_input = input("输入基础模型（默认 Qwen/Qwen2.5-3B-Instruct）: ").strip() or "Qwen/Qwen2.5-3B-Instruct"
+    model_name = ensure_model_downloaded(python_bin, model_name_input, hf_hub_cache)
+    progress.advance(1)
+    progress.finish_step(model_name)
+
     progress.start_step("生成训练配置", 1)
-    model_name = input("输入基础模型（默认 Qwen/Qwen2.5-3B-Instruct）: ").strip() or "Qwen/Qwen2.5-3B-Instruct"
+    quality_stats = analyze_sharegpt_quality(dataset_json)
+    print(
+        "[数据质量] "
+        f"tier={quality_stats['quality_tier']} "
+        f"avg_gpt_len={quality_stats['avg_gpt_len']} "
+        f"short_gpt_ratio={quality_stats['short_gpt_ratio']} "
+        f"dup_pair_ratio={quality_stats['dup_pair_ratio']}"
+    )
     template = infer_template_from_model(model_name)
     config_path = config_dir / f"{dataset_name}_sft.yaml"
     write_train_yaml(
@@ -1153,25 +1739,33 @@ def run_training_pipeline(dataset_json: Path, sample_count: int):
         dataset_dir=dataset_dir,
         output_dir=model_out_dir,
         sample_count=sample_count,
+        quality_stats=quality_stats,
     )
     progress.advance(1)
     progress.finish_step(str(config_path))
 
     progress.start_step("启动训练", 1)
-    if cli_bin.exists():
-        train_cmd = [str(cli_bin), "train", str(config_path)]
-    else:
-        train_cmd = [str(python_bin), "-m", "llamafactory.cli", "train", str(config_path)]
-    run_cmd(train_cmd, cwd=repo_dir)
+    train_cmd = [str(python_bin), "-m", "llamafactory.cli", "train", str(config_path)]
+    offline_env = os.environ.copy()
+    offline_env["TRANSFORMERS_OFFLINE"] = "1"
+    offline_env["HF_HUB_OFFLINE"] = "1"
+    offline_env["HF_DATASETS_OFFLINE"] = "1"
+    offline_env["HF_HOME"] = str(hf_home)
+    offline_env["HF_DATASETS_CACHE"] = str(hf_datasets_cache)
+    offline_env["HF_HUB_CACHE"] = str(hf_hub_cache)
+    offline_env["HUGGINGFACE_HUB_CACHE"] = str(hf_hub_cache)
+    Path(offline_env["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+    Path(offline_env["HF_DATASETS_CACHE"]).mkdir(parents=True, exist_ok=True)
+    Path(offline_env["HF_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
+    Path(offline_env["HUGGINGFACE_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
+
+    run_cmd(train_cmd, cwd=repo_dir, env=offline_env)
     progress.advance(1)
     progress.finish_step("训练完成")
 
     progress.start_step("启动 WebUI", 1)
-    if cli_bin.exists():
-        webui_cmd = [str(cli_bin), "webui"]
-    else:
-        webui_cmd = [str(python_bin), "-m", "llamafactory.cli", "webui"]
-    subprocess.Popen(webui_cmd, cwd=str(repo_dir))
+    webui_cmd = [str(python_bin), "-m", "llamafactory.cli", "webui"]
+    subprocess.Popen(webui_cmd, cwd=str(repo_dir), env=offline_env)
     progress.advance(1)
     progress.finish_step("WebUI 已启动")
 
@@ -1181,9 +1775,41 @@ def run_training_pipeline(dataset_json: Path, sample_count: int):
 
 
 def main():
-    input_key = input("请输入 OPENAI_API_KEY（留空跳过）: ").strip()
+    if prompt_yes_no("数据已整理好，是否直接用 all_users_sharegpt.json 开始训练", default=False):
+        merged_path = DATA_DIR / "all_users_sharegpt.json"
+        rows = load_json_file(merged_path)
+        if not rows:
+            print(f"未找到可训练数据或文件为空: {merged_path}")
+            return
+        print(f"检测到已整理数据: {merged_path} ({len(rows)} 条)")
+
+        empty_path = DATA_DIR / "all_users_empty_human_for_manual_completion.json"
+        if empty_path.exists():
+            missing = find_missing_empty_human_records(rows, load_json_file(empty_path))
+            if missing:
+                print(f"检测到空human文件中有 {len(missing)} 条未并入训练集。")
+                if prompt_yes_no("是否先用 Gemini 补全并合并后再训练", default=False):
+                    if not (os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()):
+                        input_key = input("请输入 GEMINI_API_KEY（留空取消补全）: ").strip()
+                        if input_key:
+                            os.environ["GEMINI_API_KEY"] = input_key
+                    if os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip():
+                        filled, added = integrate_completed_empty_human(merged_path, empty_path)
+                        rows = load_json_file(merged_path)
+                        print(f"补全完成: filled={filled}, merged_added={added}, 当前训练样本={len(rows)}")
+                    else:
+                        print("未检测到 Gemini Key，跳过补全合并。")
+
+        if prompt_yes_no("是否直接开始训练并自动启动 WebUI", default=True):
+            try:
+                run_training_pipeline(merged_path, len(rows))
+            except Exception as exc:
+                print(f"训练流程失败: {exc}")
+        return
+
+    input_key = input("请输入 GEMINI_API_KEY（留空跳过）: ").strip()
     if input_key:
-        os.environ["OPENAI_API_KEY"] = input_key
+        os.environ["GEMINI_API_KEY"] = input_key
 
     raw = input("请输入用户名（可多个，逗号分隔）: ")
     usernames = parse_usernames(raw)
@@ -1191,9 +1817,9 @@ def main():
         print("未提供有效用户名")
         return
 
-    fill_empty_human = prompt_yes_no("是否补全空human（失败样本会删除）", default=False)
-    if fill_empty_human and not os.getenv("OPENAI_API_KEY", "").strip():
-        print("未检测到 OPENAI_API_KEY，无法补全，自动关闭补全。")
+    fill_empty_human = prompt_yes_no("是否补全空human", default=False)
+    if fill_empty_human and not (os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()):
+        print("未检测到 GEMINI_API_KEY（或 GOOGLE_API_KEY），无法补全，自动关闭补全。")
         fill_empty_human = False
 
     out_files = []
