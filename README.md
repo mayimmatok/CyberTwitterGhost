@@ -10,14 +10,14 @@
 - 稳定网络，可访问以下服务：  
   Stable network access to:
   - `web.archive.org`（抓取快照 / snapshot crawling）
-  - OpenAI 兼容接口（仅在启用空 `human` 补全时需要 / only for empty-`human` completion）
+  - Gemini 兼容接口（仅在启用空 `human` 补全时需要 / only for empty-`human` completion）
   - `github.com`（仅在启用自动训练并克隆 LLaMA-Factory 时需要 / only for auto-training setup）
-- OpenAI API Key（可选）  
-  Optional OpenAI API key:
+- Gemini API Key（可选）  
+  Optional Gemini API key:
   - 用途：补全空 `human` 对话  
     Used for empty-`human` completion
-  - 获取：在 OpenAI 平台创建 API Key（或使用兼容服务商 Key）  
-    Get it from OpenAI dashboard (or compatible provider)
+  - 获取：在 Gemini 平台创建 API Key（或使用兼容服务商 Key）  
+    Get it from Gemini dashboard (or compatible provider)
 - 显卡（仅训练需要）  
   GPU is only required for training:
   - 推荐 NVIDIA RTX 5070 或更高，支持 CUDA 环境  
@@ -65,7 +65,7 @@ python tool.py
 
 ### 2. 按提示输入
 
-1. `OPENAI_API_KEY`（可留空）
+1. `Gemini_API_KEY`（可留空）
 2. 用户名（支持多个，逗号分隔）
 3. 是否启用空 `human` 补全
 4. 是否在数据完成后直接训练并启动 WebUI
@@ -87,7 +87,7 @@ python tool.py
 
 ### 2. Follow prompts
 
-1. `OPENAI_API_KEY` (optional)
+1. `Gemini_API_KEY` (optional)
 2. Username(s), comma-separated
 3. Whether to enable empty-`human` completion
 4. Whether to train and launch WebUI after dataset generation
@@ -101,9 +101,9 @@ python tool.py
 
 ## 环境变量 / Environment Variables
 
-- `OPENAI_API_KEY` (for AI completion)
-- `OPENAI_BASE_URL` (optional, default: `https://api.openai.com/v1`)
-- `OPENAI_MODEL` (optional, default: `gpt-4o-mini`)
+- `Gemini_API_KEY` (for AI completion)
+- `OPENAI_BASE_URL` (optional)
+- `OPENAI_MODEL` (optional)
 
 ---
 
