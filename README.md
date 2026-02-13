@@ -35,7 +35,7 @@
   - 回复场景：`human=被回复内容`，`gpt=用户回复`
   - 主动发言：`human=""`，`gpt=当前发言`
 - 文本清洗：去 `@用户名`、去链接、繁转简
-- 可选 AI 补全空 `human`（补全失败或选择不补全会删除该样本）
+- 可选 AI 补全空 `human`
 - 导出 ShareGPT 风格 JSON
 - 可选一键接入 LLaMA-Factory 训练并启动 WebUI
 
@@ -49,7 +49,7 @@
   - Reply case: `human=parent tweet`, `gpt=user reply`
   - Standalone case: `human=""`, `gpt=current tweet`
 - Text cleanup: remove `@mentions`, remove links, convert Traditional Chinese to Simplified Chinese
-- Optional AI completion for empty `human` (failed completions or cases without completions are removed)
+- Optional AI completion for empty `human` 
 - Export ShareGPT-style JSON
 - Optional one-click LLaMA-Factory training + WebUI launch
 
